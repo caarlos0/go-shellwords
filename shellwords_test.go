@@ -1,9 +1,11 @@
 package shellwords
 
 import (
+	"errors"
 	"fmt"
 	"go/build"
 	"os"
+	"os/exec"
 	"reflect"
 	"testing"
 )
@@ -31,6 +33,8 @@ var testcases = []struct {
 	{`a ' b '`, []string{`a`, ` b `}},
 	{`a '   '`, []string{`a`, `   `}},
 	{`foo "" bar ''`, []string{`foo`, ``, `bar`, ``}},
+	{`foo \\`, []string{`foo`, `\`}},
+	{`foo \& bar`, []string{`foo`, `&`, `bar`}},
 }
 
 func TestSimple(t *testing.T) {
@@ -100,6 +104,9 @@ func TestBacktick(t *testing.T) {
 
 	parser.ParseBacktick = false
 	args, err = parser.Parse(`echo $(echo "foo")`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	expected = []string{"echo", `$(echo "foo")`}
 	if !reflect.DeepEqual(args, expected) {
 		t.Fatalf("Expected %#v, but %#v:", expected, args)
@@ -134,9 +141,9 @@ func TestBacktickError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Should be an error")
 	}
-	expected := "exit status 2:go Version: unknown command\nRun 'go help' for usage.\n"
-	if expected != err.Error() {
-		t.Fatalf("Expected %q, but %q", expected, err.Error())
+	var eerr *exec.ExitError
+	if !errors.As(err, &eerr) {
+		t.Fatal("Should be able to unwrap to *exec.ExitError")
 	}
 	_, err = parser.Parse(`echo $(echo1)`)
 	if err == nil {
@@ -239,9 +246,9 @@ func TestEnvArgumentsFail(t *testing.T) {
 		t.Fatal("Should be an error")
 	}
 	os.Setenv("FOO", "bar `")
-	_, err = parser.Parse("$FOO ")
+	result, err := parser.Parse("$FOO ")
 	if err == nil {
-		t.Fatal("Should be an error")
+		t.Fatal("Should be an error: ", result)
 	}
 }
 
@@ -251,20 +258,20 @@ func TestDupEnv(t *testing.T) {
 
 	parser := NewParser()
 	parser.ParseEnv = true
-	args, err := parser.Parse("echo $$FOO$")
+	args, err := parser.Parse("echo $FOO$")
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []string{"echo", "$bar$"}
+	expected := []string{"echo", "bar$"}
 	if !reflect.DeepEqual(args, expected) {
 		t.Fatalf("Expected %#v, but %#v:", expected, args)
 	}
 
-	args, err = parser.Parse("echo $${FOO_BAR}$")
+	args, err = parser.Parse("echo ${FOO_BAR}$")
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected = []string{"echo", "$baz$"}
+	expected = []string{"echo", "baz$"}
 	if !reflect.DeepEqual(args, expected) {
 		t.Fatalf("Expected %#v, but %#v:", expected, args)
 	}
@@ -274,12 +281,12 @@ func TestHaveMore(t *testing.T) {
 	parser := NewParser()
 	parser.ParseEnv = true
 
-	line := "echo foo; seq 1 10"
+	line := "echo 🍺; seq 1 10"
 	args, err := parser.Parse(line)
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
-	expected := []string{"echo", "foo"}
+	expected := []string{"echo", "🍺"}
 	if !reflect.DeepEqual(args, expected) {
 		t.Fatalf("Expected %#v, but %#v:", expected, args)
 	}
@@ -332,5 +339,71 @@ func TestBackquoteInFlag(t *testing.T) {
 	expected := []string{"cmd", "-flag=val1", "-flag=val2"}
 	if !reflect.DeepEqual(args, expected) {
 		t.Fatalf("Expected %#v, but %#v:", expected, args)
+	}
+}
+
+func TestEnvInQuoted(t *testing.T) {
+	os.Setenv("FOO", "bar")
+
+	parser := NewParser()
+	parser.ParseEnv = true
+	args, err := parser.Parse(`ssh 127.0.0.1 "echo $FOO"`)
+	if err != nil {
+		panic(err)
+	}
+	expected := []string{"ssh", "127.0.0.1", "echo bar"}
+	if !reflect.DeepEqual(args, expected) {
+		t.Fatalf("Expected %#v, but %#v:", expected, args)
+	}
+
+	args, err = parser.Parse(`ssh 127.0.0.1 "echo \\$FOO"`)
+	if err != nil {
+		panic(err)
+	}
+	expected = []string{"ssh", "127.0.0.1", "echo $FOO"}
+	if !reflect.DeepEqual(args, expected) {
+		t.Fatalf("Expected %#v, but %#v:", expected, args)
+	}
+}
+
+func TestParseWithEnvs(t *testing.T) {
+	tests := []struct {
+		line               string
+		wantEnvs, wantArgs []string
+	}{
+		{
+			line:     "FOO=foo cmd --args=A=B",
+			wantEnvs: []string{"FOO=foo"},
+			wantArgs: []string{"cmd", "--args=A=B"},
+		},
+		{
+			line:     "FOO=foo BAR=bar cmd --args=A=B -A=B",
+			wantEnvs: []string{"FOO=foo", "BAR=bar"},
+			wantArgs: []string{"cmd", "--args=A=B", "-A=B"},
+		},
+		{
+			line:     `sh -c "FOO=foo BAR=bar cmd --args=A=B -A=B"`,
+			wantEnvs: []string{},
+			wantArgs: []string{"sh", "-c", "FOO=foo BAR=bar cmd --args=A=B -A=B"},
+		},
+		{
+			line:     "cmd --args=A=B -A=B",
+			wantEnvs: []string{},
+			wantArgs: []string{"cmd", "--args=A=B", "-A=B"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			envs, args, err := ParseWithEnvs(tt.line)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(envs, tt.wantEnvs) {
+				t.Errorf("Expected %#v, but %#v", tt.wantEnvs, envs)
+			}
+			if !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("Expected %#v, but %#v", tt.wantArgs, args)
+			}
+		})
 	}
 }
